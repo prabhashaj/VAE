@@ -43,3 +43,9 @@ venv.bak/
 # OS files
 .DS_Store
 Thumbs.db
+
+# Project generated data and models
+data/train.jsonl
+data/eval.jsonl
+data/prompt_injection_test_dataset_predictions.csv
+scratch/
