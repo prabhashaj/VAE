@@ -1,9 +1,10 @@
 """Improved MLP classifier head for prompt injection detection.
 
 Architecture (with USE_LEXICAL_FEATURES=True):
-    Input (768 + 16 = 784-dim: mpnet embedding + lexical features)
-      → Linear(784, 512) → LayerNorm → GELU → Dropout(0.2)
-      → Linear(512, 256) → LayerNorm → GELU → Dropout(0.2)  [+ residual proj]
+    Input (384 + 25 = 409-dim: MiniLM embedding + lexical features)
+      → Linear(409, 512) → LayerNorm → GELU → Dropout(0.2)
+      → Linear(512, 384) → LayerNorm → GELU → Dropout(0.2)  [+ residual proj]
+      → Linear(384, 256) → LayerNorm → GELU → Dropout(0.2)  [+ residual proj]
       → Linear(256, 128) → LayerNorm → GELU → Dropout(0.2)
       → Linear(128, 2) (logits)
 
@@ -11,8 +12,9 @@ Key improvements over previous version:
   - LayerNorm instead of BatchNorm: stable for variable sequence lengths,
     no issues with small batches or batch statistics drift at inference.
   - Residual connections: prevent information collapse through depth.
-  - Wider first layer (784→512) to handle the richer 768-dim encoder.
+  - Deeper network [512, 384, 256, 128] to handle 25-dim lexical features.
   - Kaiming init tuned for GELU (uses 'relu' mode as close approximation).
+  - TemperatureScaler: post-hoc calibration via a single learned temperature T.
   - predict_with_uncertainty(): 3-way output (benign / injection / uncertain)
     using a calibrated confidence threshold.
 """
@@ -135,3 +137,71 @@ class MLPClassifier(nn.Module):
                 "benign_prob": round(benign_p, 4),
             })
         return results
+
+
+class TemperatureScaler(nn.Module):
+    """Post-hoc calibration wrapper using temperature scaling (Guo et al., 2017).
+
+    Learns a single scalar temperature T on the validation set after all
+    training phases. Calibrated softmax:
+        p_calibrated = softmax(logits / T)
+
+    Usage:
+        scaler = TemperatureScaler(model)
+        scaler.calibrate(val_loader, device)   # fits T
+        probs = scaler.predict_proba(x)        # calibrated probs
+    """
+
+    def __init__(self, model: MLPClassifier) -> None:
+        super().__init__()
+        self.model = model
+        # Initialize temperature to 1.0 (no scaling)
+        self.temperature = nn.Parameter(torch.ones(1) * 1.0)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """Return temperature-scaled logits."""
+        logits = self.model(x)
+        return logits / self.temperature.clamp(min=0.1)  # clamp to avoid div-by-zero
+
+    def predict_proba(self, x: torch.Tensor) -> torch.Tensor:
+        """Return calibrated softmax probabilities (batch, num_classes)."""
+        with torch.no_grad():
+            return torch.softmax(self(x), dim=-1)
+
+    def calibrate(
+        self,
+        val_loader,
+        device: torch.device,
+        lr: float = 0.01,
+        max_iter: int = 50,
+    ) -> float:
+        """Fit temperature T by minimizing NLL on the validation set.
+
+        Returns the fitted temperature value.
+        """
+        self.model.eval()
+        nll_criterion = nn.CrossEntropyLoss()
+        optimizer = torch.optim.LBFGS([self.temperature], lr=lr, max_iter=max_iter)
+
+        # Collect all logits and labels first (no need to recompute each step)
+        all_logits, all_labels = [], []
+        with torch.no_grad():
+            for emb, lbl in val_loader:
+                emb = emb.to(device)
+                all_logits.append(self.model(emb).to(device))
+                all_labels.append(lbl.to(device))
+        all_logits = torch.cat(all_logits)
+        all_labels = torch.cat(all_labels)
+
+        def _eval_closure():
+            optimizer.zero_grad()
+            scaled = all_logits / self.temperature.clamp(min=0.1)
+            loss = nll_criterion(scaled, all_labels)
+            loss.backward()
+            return loss
+
+        optimizer.step(_eval_closure)
+
+        fitted_T = float(self.temperature.item())
+        print(f"  Temperature calibration: T={fitted_T:.4f}")
+        return fitted_T

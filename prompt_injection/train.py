@@ -1,13 +1,14 @@
-"""Training loop for the prompt injection MLP classifier (v2).
+"""Training loop for the prompt injection MLP classifier (v3).
 
 Pipeline:
   1. Load/generate JSONL data
-  2. Encode all texts with all-mpnet-base-v2  (done once, kept in RAM)
-  3. Concatenate handcrafted lexical features (16-dim)
-  4. Phase 1: Train MLP on balanced dataset with label smoothing + OneCycleLR
-  5. Phase 2: Fine-tune on hard negatives (false-positive benign prompts)
-  6. Threshold calibration via F1 sweep on val set
-  7. Save best checkpoint with calibrated threshold
+  2. Encode all texts with all-MiniLM-L6-v2  (done once, kept in RAM)
+  3. Concatenate handcrafted lexical features (25-dim)
+  4. Phase 1: Train MLP with FocalLoss + Mixup + OneCycleLR + label smoothing
+  5. Phase 2: Fine-tune on hard negatives (both FP benign and FN injection)
+  6. Temperature calibration via LBFGS on val set
+  7. Threshold calibration via F1 sweep on val set
+  8. Save best checkpoint with calibrated threshold + temperature
 
 Run:
     python -m prompt_injection.train
@@ -20,6 +21,7 @@ from pathlib import Path
 import numpy as np
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 from torch.utils.data import DataLoader
 from sklearn.metrics import classification_report, f1_score
 
@@ -27,13 +29,14 @@ from prompt_injection.config import (
     TRAIN_FILE, EVAL_FILE, MODEL_PATH, CHECKPOINT_DIR,
     EMBEDDING_MODEL, BATCH_SIZE, EPOCHS, LEARNING_RATE,
     WEIGHT_DECAY, EARLY_STOP_PAT, SEED, LABEL_SMOOTHING,
-    PHASE2_EPOCHS, PHASE2_LR, HARD_NEG_UPSAMPLE,
+    PHASE2_EPOCHS, PHASE2_LR, HARD_NEG_UPSAMPLE, HARD_FN_UPSAMPLE,
     CONFIDENCE_THRESHOLD, USE_LEXICAL_FEATURES,
+    MIXUP_ALPHA, FOCAL_GAMMA, FOCAL_ALPHA,
 )
 from prompt_injection.dataset import (
     load_jsonl, load_encoder, EmbeddingDataset, build_dataset_cached
 )
-from prompt_injection.model import MLPClassifier
+from prompt_injection.model import MLPClassifier, TemperatureScaler
 
 
 # ─── Reproducibility ──────────────────────────────────────────────────────────
@@ -46,6 +49,89 @@ def set_seed(seed: int) -> None:
         torch.cuda.manual_seed_all(seed)
 
 
+# ─── Focal Loss ───────────────────────────────────────────────────────────────
+
+class FocalLoss(nn.Module):
+    """Focal Loss (Lin et al., 2017) for class-imbalanced training.
+
+    FL(p) = −α · (1 − pₜ)^γ · log(pₜ)
+
+    Down-weights easy examples and focuses gradient on hard ones.
+    With γ=2, α=0.25 this is the standard RetinaNet configuration.
+    Supports optional class weights and label smoothing.
+    """
+
+    def __init__(
+        self,
+        gamma: float = FOCAL_GAMMA,
+        alpha: float = FOCAL_ALPHA,
+        weight: torch.Tensor | None = None,
+        label_smoothing: float = 0.0,
+        reduction: str = "mean",
+    ) -> None:
+        super().__init__()
+        self.gamma           = gamma
+        self.alpha           = alpha
+        self.weight          = weight    # class weight tensor (num_classes,)
+        self.label_smoothing = label_smoothing
+        self.reduction       = reduction
+
+    def forward(self, logits: torch.Tensor, targets: torch.Tensor) -> torch.Tensor:
+        # Standard CE with label smoothing gives per-sample loss
+        ce_loss = F.cross_entropy(
+            logits, targets,
+            weight=self.weight,
+            label_smoothing=self.label_smoothing,
+            reduction="none",
+        )
+        # Focal modulation: (1 - p_t)^gamma
+        probs = torch.softmax(logits, dim=-1)
+        pt    = probs.gather(1, targets.unsqueeze(1)).squeeze(1)
+        focal_weight = (1.0 - pt) ** self.gamma
+        loss = focal_weight * ce_loss
+
+        if self.reduction == "mean":
+            return loss.mean()
+        elif self.reduction == "sum":
+            return loss.sum()
+        return loss
+
+
+# ─── Mixup ────────────────────────────────────────────────────────────────────
+
+def mixup_batch(
+    embeddings: torch.Tensor,
+    labels: torch.Tensor,
+    alpha: float = MIXUP_ALPHA,
+    num_classes: int = 2,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Apply Mixup (Zhang et al., 2018) to a batch of embeddings.
+
+    Interpolates pairs of samples in embedding space:
+        x̃ = λ·xᵢ + (1−λ)·xⱼ
+        ỹ = λ·yᵢ + (1−λ)·yⱼ,  λ ~ Beta(α, α)
+
+    Returns mixed embeddings and soft (one-hot) labels.
+    """
+    if alpha <= 0.0:
+        # No mixup — return one-hot labels
+        soft_labels = F.one_hot(labels, num_classes=num_classes).float()
+        return embeddings, soft_labels
+
+    lam = float(np.random.beta(alpha, alpha))
+    batch_size = embeddings.size(0)
+    idx = torch.randperm(batch_size, device=embeddings.device)
+
+    mixed_emb = lam * embeddings + (1.0 - lam) * embeddings[idx]
+
+    # Convert labels to one-hot and mix
+    y_a = F.one_hot(labels, num_classes=num_classes).float()
+    y_b = F.one_hot(labels[idx], num_classes=num_classes).float()
+    mixed_labels = lam * y_a + (1.0 - lam) * y_b
+
+    return mixed_emb, mixed_labels
+
+
 # ─── Training helpers ─────────────────────────────────────────────────────────
 
 def train_epoch(
@@ -54,21 +140,34 @@ def train_epoch(
     optimizer: torch.optim.Optimizer,
     criterion: nn.Module,
     device: torch.device,
-    scheduler=None,   # if provided, stepped once per batch (e.g. OneCycleLR)
+    scheduler=None,       # if provided, stepped once per batch (e.g. OneCycleLR)
+    use_mixup: bool = True,
 ) -> float:
     model.train()
     total_loss = 0.0
+
     for embeddings, labels in loader:
         embeddings, labels = embeddings.to(device), labels.to(device)
-        optimizer.zero_grad()
-        logits = model(embeddings)
-        loss = criterion(logits, labels)
+
+        if use_mixup and MIXUP_ALPHA > 0:
+            mixed_emb, mixed_labels = mixup_batch(embeddings, labels)
+            optimizer.zero_grad()
+            logits = model(mixed_emb)
+            # Mixed CE: sum of CE against each mixed label component
+            log_probs = F.log_softmax(logits, dim=-1)
+            loss = -(mixed_labels * log_probs).sum(dim=-1).mean()
+        else:
+            optimizer.zero_grad()
+            logits = model(embeddings)
+            loss = criterion(logits, labels)
+
         loss.backward()
         nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
         optimizer.step()
         if scheduler is not None:
             scheduler.step()          # OneCycleLR: step per batch
         total_loss += loss.item() * len(labels)
+
     return total_loss / len(loader.dataset)  # type: ignore[arg-type]
 
 
@@ -102,12 +201,12 @@ def evaluate(
 
 @torch.no_grad()
 def calibrate_threshold(
-    model: MLPClassifier,
+    model: nn.Module,
     loader: DataLoader,
     device: torch.device,
 ) -> float:
     """
-    Sweep injection probability thresholds [0.40, 0.80] and return the
+    Sweep injection probability thresholds [0.35, 0.80] and return the
     threshold that maximises macro-F1 on the validation set.
     """
     model.eval()
@@ -125,7 +224,7 @@ def calibrate_threshold(
         preds = [1 if p >= thresh else 0 for p in all_probs]
         f1 = f1_score(all_labels, preds, average="macro", zero_division=0)
         if f1 > best_f1:
-            best_f1    = f1
+            best_f1     = f1
             best_thresh = float(thresh)
 
     print(f"  Calibrated threshold: {best_thresh:.2f}  (val macro-F1={best_f1:.4f})")
@@ -140,18 +239,27 @@ def mine_hard_negatives(
     eval_dataset: EmbeddingDataset,
     device: torch.device,
     threshold: float = CONFIDENCE_THRESHOLD,
-    upsample: int = HARD_NEG_UPSAMPLE,
+    fp_upsample: int = HARD_NEG_UPSAMPLE,
+    fn_upsample: int = HARD_FN_UPSAMPLE,
 ) -> EmbeddingDataset | None:
     """
-    Find benign validation samples that the model misclassifies as injection
-    (false positives). Return an upsampled dataset of these hard negatives
+    Find hard examples the model gets wrong and return an upsampled dataset
     for Phase-2 fine-tuning.
+
+    Mines two categories:
+      - False Positives (FP): benign samples predicted as injection → upsampled ×fp_upsample
+      - False Negatives (FN): injection samples predicted as benign → upsampled ×fn_upsample
+        (higher factor: a missed attack is more dangerous than a false alarm)
+
+    Returns None if no hard examples are found.
     """
     model.eval()
     loader = DataLoader(eval_dataset, batch_size=256, shuffle=False)
 
-    hard_embs:   list[torch.Tensor] = []
-    hard_labels: list[int]          = []
+    fp_embs:   list[torch.Tensor] = []  # benign → wrongly injection
+    fp_labels: list[int]          = []
+    fn_embs:   list[torch.Tensor] = []  # injection → wrongly benign
+    fn_labels: list[int]          = []
 
     offset = 0
     for embs, lbls in loader:
@@ -159,18 +267,38 @@ def mine_hard_negatives(
         probs = model.predict_proba(embs_dev)[:, 1].cpu()
 
         for i, (prob, lbl) in enumerate(zip(probs.tolist(), lbls.tolist())):
-            if lbl == 0 and prob >= threshold:          # benign but predicted injection
-                hard_embs.append(eval_dataset.embeddings[offset + i])
-                hard_labels.append(0)
+            if lbl == 0 and prob >= threshold:
+                # Benign but predicted injection (false positive)
+                fp_embs.append(eval_dataset.embeddings[offset + i])
+                fp_labels.append(0)
+            elif lbl == 1 and prob < threshold:
+                # Injection but predicted benign (false negative — more dangerous)
+                fn_embs.append(eval_dataset.embeddings[offset + i])
+                fn_labels.append(1)
         offset += len(lbls)
 
-    if not hard_embs:
+    n_fp = len(fp_embs)
+    n_fn = len(fn_embs)
+
+    if n_fp == 0 and n_fn == 0:
         print("  No hard negatives found — skipping Phase 2.")
         return None
 
-    print(f"  Found {len(hard_embs):,} hard negatives → upsampled x{upsample}")
-    emb_tensor = torch.stack(hard_embs * upsample)
-    lbl_tensor = torch.tensor(hard_labels * upsample, dtype=torch.long)
+    print(f"  Hard FP (benign->injection): {n_fp:,} -> upsampled x{fp_upsample}")
+    print(f"  Hard FN (injection->benign): {n_fn:,} -> upsampled x{fn_upsample}")
+
+    all_embs:   list[torch.Tensor] = []
+    all_labels: list[int]          = []
+
+    if fp_embs:
+        all_embs.extend(fp_embs * fp_upsample)
+        all_labels.extend(fp_labels * fp_upsample)
+    if fn_embs:
+        all_embs.extend(fn_embs * fn_upsample)
+        all_labels.extend(fn_labels * fn_upsample)
+
+    emb_tensor = torch.stack(all_embs)
+    lbl_tensor = torch.tensor(all_labels, dtype=torch.long)
 
     # Wrap in a simple EmbeddingDataset-compatible object
     ds = EmbeddingDataset.__new__(EmbeddingDataset)
@@ -267,15 +395,27 @@ def train(
         anneal_strategy="cos",
     )
 
-    # Label smoothing prevents overconfidence on noisy labels
+    # Compute class weights for FocalLoss (same formula as before)
     n_benign    = train_labels.count(0)
     n_injection = train_labels.count(1)
     n_total     = n_benign + n_injection
     w_benign    = n_total / (2.0 * n_benign)    if n_benign    > 0 else 1.0
     w_injection = n_total / (2.0 * n_injection) if n_injection > 0 else 1.0
     class_weights = torch.tensor([w_benign, w_injection], dtype=torch.float32).to(device)
-    criterion = nn.CrossEntropyLoss(weight=class_weights, label_smoothing=LABEL_SMOOTHING)
+
+    # Phase 1 uses FocalLoss instead of CrossEntropyLoss
+    criterion = FocalLoss(
+        gamma=FOCAL_GAMMA,
+        alpha=FOCAL_ALPHA,
+        weight=class_weights,
+        label_smoothing=LABEL_SMOOTHING,
+    )
+    # Eval criterion: plain CE (no focal) for stable val loss monitoring
+    eval_criterion = nn.CrossEntropyLoss(weight=class_weights, label_smoothing=LABEL_SMOOTHING)
+
     print(f"  Class weights: benign={w_benign:.3f}  injection={w_injection:.3f}")
+    print(f"  FocalLoss: gamma={FOCAL_GAMMA}  alpha={FOCAL_ALPHA}")
+    print(f"  Mixup alpha: {MIXUP_ALPHA}")
     print(f"  Label smoothing: {LABEL_SMOOTHING}")
 
     # ── Phase 1: Training loop ────────────────────────────────────────────────
@@ -283,16 +423,19 @@ def train(
     best_f1    = 0.0
     no_improve = 0
 
-    print(f"\n{'─'*65}")
+    print(f"\n{'='*65}")
     print(f"  PHASE 1 — Full balanced training ({EPOCHS} epochs max)")
-    print(f"{'─'*65}")
+    print(f"{'='*65}")
     print(f"{'Epoch':>6}  {'Train Loss':>11}  {'Val Loss':>9}  {'Val F1':>8}  {'LR':>10}")
     print("-" * 55)
 
     for epoch in range(1, EPOCHS + 1):
-        train_loss = train_epoch(model, train_loader, optimizer, criterion, device,
-                                 scheduler=scheduler)  # scheduler stepped per batch
-        val_loss, val_f1, _, _ = evaluate(model, eval_loader, criterion, device)
+        train_loss = train_epoch(
+            model, train_loader, optimizer, criterion, device,
+            scheduler=scheduler,   # OneCycleLR stepped per batch
+            use_mixup=True,
+        )
+        val_loss, val_f1, _, _ = evaluate(model, eval_loader, eval_criterion, device)
 
         lr = optimizer.param_groups[0]["lr"]
 
@@ -310,6 +453,7 @@ def train(
                     "val_loss": val_loss,
                     "input_dim": input_dim,
                     "threshold": CONFIDENCE_THRESHOLD,
+                    "temperature": 1.0,
                 },
                 model_path,
             )
@@ -326,13 +470,18 @@ def train(
     model.load_state_dict(ckpt["model_state_dict"])
 
     # ── Phase 2: Hard negative fine-tuning ────────────────────────────────────
-    print(f"\n{'─'*65}")
+    print(f"\n{'='*65}")
     print(f"  PHASE 2 — Hard negative fine-tuning ({PHASE2_EPOCHS} epochs)")
-    print(f"{'─'*65}")
+    print(f"{'='*65}")
 
     # First calibrate threshold so we can identify hard negatives correctly
     initial_threshold = calibrate_threshold(model, eval_loader, device)
-    hard_neg_ds = mine_hard_negatives(model, eval_dataset, device, threshold=initial_threshold)
+    hard_neg_ds = mine_hard_negatives(
+        model, eval_dataset, device,
+        threshold=initial_threshold,
+        fp_upsample=HARD_NEG_UPSAMPLE,
+        fn_upsample=HARD_FN_UPSAMPLE,
+    )
 
     if hard_neg_ds is not None:
         # Mix hard negatives into training
@@ -345,7 +494,7 @@ def train(
 
         p2_optimizer = torch.optim.AdamW(model.parameters(), lr=PHASE2_LR, weight_decay=WEIGHT_DECAY)
         p2_scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(p2_optimizer, T_max=PHASE2_EPOCHS, eta_min=1e-6)
-        # Equal weight in Phase 2 — we want the model to treat benign/injection symmetrically
+        # Equal weight in Phase 2 — symmetric treatment of both classes
         p2_criterion = nn.CrossEntropyLoss(label_smoothing=LABEL_SMOOTHING)
 
         p2_best_f1 = best_f1
@@ -353,7 +502,9 @@ def train(
         print("-" * 45)
 
         for epoch in range(1, PHASE2_EPOCHS + 1):
-            train_loss = train_epoch(model, phase2_loader, p2_optimizer, p2_criterion, device)
+            train_loss = train_epoch(
+                model, phase2_loader, p2_optimizer, p2_criterion, device, use_mixup=False
+            )
             val_loss, val_f1, _, _ = evaluate(model, eval_loader, p2_criterion, device)
             p2_scheduler.step()
 
@@ -370,6 +521,7 @@ def train(
                         "val_loss": val_loss,
                         "input_dim": input_dim,
                         "threshold": CONFIDENCE_THRESHOLD,
+                        "temperature": 1.0,
                     },
                     model_path,
                 )
@@ -378,33 +530,41 @@ def train(
         ckpt = torch.load(model_path, map_location=device, weights_only=False)
         model.load_state_dict(ckpt["model_state_dict"])
 
-    # ── Threshold calibration (final) ────────────────────────────────────────
-    print(f"\n{'─'*65}")
-    print(f"  Calibrating inference threshold on validation set...")
-    print(f"{'─'*65}")
-    best_threshold = calibrate_threshold(model, eval_loader, device)
+    # ── Temperature calibration ───────────────────────────────────────────────
+    print(f"\n{'='*65}")
+    print(f"  TEMPERATURE CALIBRATION (Guo et al., 2017)")
+    print(f"{'='*65}")
+    scaler = TemperatureScaler(model).to(device)
+    fitted_T = scaler.calibrate(eval_loader, device)
 
-    # Update saved checkpoint with calibrated threshold
+    # ── Threshold calibration (final, on temperature-scaled model) ───────────
+    print(f"\n{'='*65}")
+    print(f"  Calibrating inference threshold on validation set...")
+    print(f"{'='*65}")
+    best_threshold = calibrate_threshold(scaler, eval_loader, device)
+
+    # Update saved checkpoint with calibrated threshold + temperature
     ckpt = torch.load(model_path, map_location=device, weights_only=False)
-    ckpt["threshold"] = best_threshold
-    ckpt["input_dim"] = input_dim
+    ckpt["threshold"]   = best_threshold
+    ckpt["temperature"] = fitted_T
+    ckpt["input_dim"]   = input_dim
     torch.save(ckpt, model_path)
-    print(f"  Checkpoint updated with threshold={best_threshold:.2f}")
+    print(f"  Checkpoint updated with threshold={best_threshold:.2f}  temperature={fitted_T:.4f}")
 
     # ── Final evaluation ─────────────────────────────────────────────────────
-    print("\nFinal evaluation (best checkpoint with calibrated threshold)...")
-    model.eval()
+    print("\nFinal evaluation (best checkpoint with calibrated threshold + temperature)...")
+    scaler.eval()
     all_preds_raw, all_probs, all_labels_lst = [], [], []
     with torch.no_grad():
         for embeddings, labels in eval_loader:
             embeddings = embeddings.to(device)
-            probs = model.predict_proba(embeddings)
+            probs = scaler.predict_proba(embeddings)
             raw_preds = (probs[:, 1] >= best_threshold).long()
             all_preds_raw.extend(raw_preds.cpu().tolist())
             all_probs.extend(probs[:, 1].cpu().tolist())
             all_labels_lst.extend(labels.tolist())
 
-    print(f"\nWith calibrated threshold={best_threshold:.2f}:")
+    print(f"\nWith calibrated threshold={best_threshold:.2f}, T={fitted_T:.4f}:")
     print(classification_report(
         all_labels_lst, all_preds_raw,
         target_names=["benign", "injection"],
@@ -419,7 +579,7 @@ def train(
             embeddings = embeddings.to(device)
             preds = model(embeddings).argmax(dim=-1)
             all_preds_argmax.extend(preds.cpu().tolist())
-    print("With argmax (threshold=0.50):")
+    print("With argmax (threshold=0.50, no temperature):")
     print(classification_report(
         all_labels_lst, all_preds_argmax,
         target_names=["benign", "injection"],

@@ -25,7 +25,7 @@ from torch.utils.data import Dataset
 from sentence_transformers import SentenceTransformer
 from tqdm import tqdm
 
-from prompt_injection.config import EMBEDDING_MODEL, USE_LEXICAL_FEATURES, DATA_DIR
+from prompt_injection.config import EMBEDDING_MODEL, USE_LEXICAL_FEATURES, DATA_DIR, ENCODE_FP16
 
 
 # ─── Embedding cache ──────────────────────────────────────────────────────────
@@ -92,12 +92,13 @@ def encode_texts_gpu_fp16(
     """
     device = next(encoder.parameters()).device
 
-    # Cast encoder to fp16 to halve VRAM for weights + activations
-    encoder.half()
+    # Cast encoder to fp16 to halve VRAM for weights + activations if ENCODE_FP16 is True
+    if ENCODE_FP16:
+        encoder.half()
 
     all_embs: list[torch.Tensor] = []
     n = len(texts)
-    desc = "Encoding (GPU fp16)"
+    desc = "Encoding (GPU fp16)" if ENCODE_FP16 else "Encoding (GPU fp32)"
     batches = range(0, n, batch_size)
 
     try:
@@ -119,7 +120,8 @@ def encode_texts_gpu_fp16(
 
     finally:
         # Always restore encoder to fp32 (don't leave it mutated)
-        encoder.float()
+        if ENCODE_FP16:
+            encoder.float()
 
     return torch.cat(all_embs, dim=0)
 

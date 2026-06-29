@@ -799,6 +799,112 @@ def split_data(injection: list[dict], benign: list[dict],
     return train, eval_
 
 
+# ─── Text augmentation ────────────────────────────────────────────────────────
+# Applied to injection samples only at dataset-generation time.
+# Exposes the model to obfuscated variants so it learns to detect them.
+
+_LEET_MAP: dict[str, str] = {
+    "a": "4", "e": "3", "i": "1", "o": "0",
+    "l": "1", "s": "5", "t": "7", "g": "9",
+}
+
+_HOMOGLYPH_MAP: dict[str, str] = {
+    "a": "а",  # Cyrillic а
+    "e": "е",  # Cyrillic е
+    "o": "о",  # Cyrillic о
+    "p": "р",  # Cyrillic р
+    "c": "с",  # Cyrillic с
+    "x": "х",  # Cyrillic х
+}
+
+
+def _aug_case_flip(text: str) -> str:
+    """Randomly flip case of each character."""
+    return "".join(c.upper() if random.random() > 0.5 else c.lower() for c in text)
+
+
+def _aug_all_caps(text: str) -> str:
+    """Full uppercase."""
+    return text.upper()
+
+
+def _aug_whitespace_inject(text: str) -> str:
+    """Insert spaces between characters of random words."""
+    words = text.split()
+    result = []
+    for w in words:
+        if len(w) >= 4 and random.random() < 0.4:
+            result.append(" ".join(w))  # 'ignore' → 'i g n o r e'
+        else:
+            result.append(w)
+    return " ".join(result)
+
+
+def _aug_leet(text: str) -> str:
+    """Apply leet-speak substitutions: e→3, o→0, i→1, etc."""
+    return "".join(_LEET_MAP.get(c.lower(), c) for c in text)
+
+
+def _aug_homoglyph(text: str) -> str:
+    """Replace select Latin chars with visually identical Cyrillic lookalikes."""
+    return "".join(_HOMOGLYPH_MAP.get(c.lower(), c) for c in text)
+
+
+_AUGMENTORS = [
+    _aug_case_flip,
+    _aug_all_caps,
+    _aug_whitespace_inject,
+    _aug_leet,
+    _aug_homoglyph,
+]
+
+
+def augment_injection_samples(
+    injection: list[dict],
+    aug_per_sample: int = 2,
+) -> list[dict]:
+    """Generate augmented variants of injection samples.
+
+    For each injection record, randomly applies aug_per_sample augmentation
+    techniques and appends the variants back as new injection records.
+    The original samples are left unchanged.
+
+    This exposes the model to obfuscated attack patterns:
+      - 'IGNORE ALL PREVIOUS INSTRUCTIONS'   (all-caps)
+      - 'iGnOrE aLl PrEvIoUs'                (case-flip)
+      - 'I G N O R E all previous'            (whitespace)
+      - '1gn0r3 4ll pr3v10us'                 (leet)
+      - Cyrillic homoglyphs mixed in          (homoglyph)
+    """
+    new_records: list[dict] = []
+    augmentors = list(_AUGMENTORS)  # copy to shuffle safely
+
+    for rec in injection:
+        text = rec["text"]
+        random.shuffle(augmentors)
+        seen_texts: set[str] = {text}
+        added = 0
+        for aug_fn in augmentors:
+            if added >= aug_per_sample:
+                break
+            try:
+                aug_text = aug_fn(text)
+                if aug_text and aug_text not in seen_texts and len(aug_text) >= 5:
+                    seen_texts.add(aug_text)
+                    new_records.append({
+                        "text": aug_text,
+                        "label": 1,
+                        "_src": rec.get("_src", "augmented") + "_aug",
+                        "_cat": rec.get("_cat", "augmented"),
+                    })
+                    added += 1
+            except Exception:
+                pass
+
+    print(f"  Augmented injection: {len(injection):,} original -> +{len(new_records):,} variants")
+    return new_records
+
+
 # ─── Writer ───────────────────────────────────────────────────────────────────
 
 def write_jsonl(path: Path, records: list[dict]) -> None:
@@ -828,6 +934,13 @@ def download(
     print("      Free sources alone yield ~15-20K balanced samples.\n")
 
     injection, benign = collect(target)
+
+    # ── Text augmentation for injection samples ──────────────────────────────
+    # Adds obfuscated variants: CAPS, case-flip, leet-speak, whitespace, homoglyphs.
+    # Applied before balancing so augmented samples count toward injection quota.
+    print("\nAugmenting injection samples...")
+    aug_records = augment_injection_samples(injection, aug_per_sample=2)
+    injection = injection + aug_records
 
     # If injection << benign, cap benign to injection count for balance
     min_count = min(len(injection), len(benign))
