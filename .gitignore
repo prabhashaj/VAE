@@ -44,8 +44,6 @@ venv.bak/
 .DS_Store
 Thumbs.db
 
-# Project generated data and models
-data/train.jsonl
-data/eval.jsonl
-data/prompt_injection_test_dataset_predictions.csv
+# Project generated data and models — now tracked via Git LFS
+# (*.pt, *.jsonl, *.csv are all handled by .gitattributes)
 scratch/
